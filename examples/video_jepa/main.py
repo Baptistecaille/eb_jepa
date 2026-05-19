@@ -6,8 +6,6 @@ Joint Embedding Predictive Architecture (JEPA) with VC regularization.
 """
 
 from pathlib import Path
-
-import fire
 import torch.nn as nn
 from omegaconf import OmegaConf
 from torch.optim import Adam
@@ -36,6 +34,7 @@ from eb_jepa.training_utils import (
     log_data_info,
     log_epoch,
     log_model_info,
+    run_training_cli,
     save_checkpoint,
     setup_device,
     setup_seed,
@@ -275,4 +274,4 @@ def run(
 
 
 if __name__ == "__main__":
-    fire.Fire(run)
+    run_training_cli(run, default_fname="examples/video_jepa/cfgs/default.yaml")

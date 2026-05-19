@@ -30,7 +30,13 @@ model:
   hpre: 32
   dstc: 32
   nsteps: 8
-  encoder_architecture: impala # impala | resnet | conv
+  encoder_architecture: impala # impala | cortical
+  latent_dim: 32
+  grid_h: 5
+  grid_w: 5
+  patch_size: 13
+  action_embed_dim: 64
+  memory_dim: 256
   train_rollout: last # last | all
   encoder_skip_connections: True
   predictor_skip_connections: True

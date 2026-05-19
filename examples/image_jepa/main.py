@@ -16,7 +16,6 @@ import os
 import time
 from pathlib import Path
 
-import fire
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -47,6 +46,7 @@ from eb_jepa.training_utils import (
     setup_device,
     setup_seed,
     setup_wandb,
+    run_training_cli,
 )
 from examples.image_jepa.dataset import (
     ImageDataset,
@@ -610,4 +610,4 @@ def run(
 
 
 if __name__ == "__main__":
-    fire.Fire(run)
+    run_training_cli(run, default_fname="examples/image_jepa/cfgs/default.yaml")

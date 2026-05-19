@@ -3,7 +3,6 @@ import os
 from pathlib import Path
 from time import time
 
-import fire
 import torch
 import torch.nn as nn
 import wandb
@@ -18,6 +17,11 @@ from eb_jepa.architectures import (
     InverseDynamicsModel,
     Projector,
     RNNPredictor,
+)
+from eb_jepa.cortical_world_model import (
+    CorticalActionEncoder,
+    CorticalObservationEncoder,
+    CorticalTemporalPredictor,
 )
 from eb_jepa.datasets.utils import init_data
 from eb_jepa.jepa import JEPA, JEPAProbe
@@ -35,6 +39,7 @@ from eb_jepa.training_utils import (
     log_data_info,
     log_epoch,
     log_model_info,
+    run_training_cli,
     save_checkpoint,
     setup_device,
     setup_seed,
@@ -171,26 +176,54 @@ def run(
             data_config.img_size,
         )
     )
-    encoder = ImpalaEncoder(
-        width=1,
-        stack_sizes=(16, cfg.model.henc, cfg.model.dstc),
-        num_blocks=2,
-        dropout_rate=None,
-        layer_norm=False,
-        input_channels=cfg.model.dobs,
-        final_ln=True,
-        mlp_output_dim=512,
-        input_shape=(cfg.model.dobs, data_config.img_size, data_config.img_size),
-    )
+    encoder_architecture = cfg.model.get("encoder_architecture", "impala")
+    if encoder_architecture == "cortical":
+        encoder = CorticalObservationEncoder(
+            in_channels=cfg.model.dobs,
+            latent_dim=cfg.model.get("latent_dim", cfg.model.dstc),
+            grid_h=cfg.model.get("grid_h", 4),
+            grid_w=cfg.model.get("grid_w", 4),
+            patch_size=cfg.model.get(
+                "patch_size", data_config.img_size // cfg.model.get("grid_h", 4)
+            ),
+            column_hidden_dim=cfg.model.get("column_hidden_dim"),
+        )
+    elif encoder_architecture == "impala":
+        encoder = ImpalaEncoder(
+            width=1,
+            stack_sizes=(16, cfg.model.henc, cfg.model.dstc),
+            num_blocks=2,
+            dropout_rate=None,
+            layer_norm=False,
+            input_channels=cfg.model.dobs,
+            final_ln=True,
+            mlp_output_dim=512,
+            input_shape=(cfg.model.dobs, data_config.img_size, data_config.img_size),
+        )
+    else:
+        raise ValueError(f"Unknown encoder_architecture: {encoder_architecture}")
     test_output = encoder(test_input)
     _, f, _, h, w = test_output.shape
-    predictor = RNNPredictor(
-        hidden_size=encoder.mlp_output_dim, final_ln=encoder.final_ln
-    )
-    aencoder = nn.Identity()
+    if encoder_architecture == "cortical":
+        action_embed_dim = cfg.model.get("action_embed_dim", 64)
+        aencoder = CorticalActionEncoder(action_dim=2, embed_dim=action_embed_dim)
+        predictor = CorticalTemporalPredictor(
+            latent_dim=f,
+            action_embed_dim=action_embed_dim,
+            memory_dim=cfg.model.get("memory_dim", 256),
+            grid_h=h,
+            grid_w=w,
+            hidden_dim=cfg.model.get("predictor_hidden_dim"),
+        )
+    else:
+        predictor = RNNPredictor(
+            hidden_size=encoder.mlp_output_dim, final_ln=encoder.final_ln
+        )
+        aencoder = nn.Identity()
+    projector_input_dim = getattr(encoder, "mlp_output_dim", f)
     if cfg.model.regularizer.use_proj:
         projector = Projector(
-            f"{encoder.mlp_output_dim}-{encoder.mlp_output_dim*4}-{encoder.mlp_output_dim*4}"
+            f"{projector_input_dim}-{projector_input_dim*4}-{projector_input_dim*4}"
         )
     else:
         projector = None
@@ -226,7 +259,7 @@ def run(
 
     # -- PROBER
     xy_head = MLPXYHead(
-        input_shape=test_output.shape[1],
+        input_shape=f * h * w,
         normalizer=loader.dataset.normalizer,
     ).to(device)
     xy_prober = JEPAProbe(
@@ -478,4 +511,4 @@ def run(
 
 
 if __name__ == "__main__":
-    fire.Fire(run)
+    run_training_cli(run, default_fname="examples/ac_video_jepa/cfgs/train.yaml")

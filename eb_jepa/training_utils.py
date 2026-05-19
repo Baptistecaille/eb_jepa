@@ -1,8 +1,9 @@
 import os
 import random
+import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -13,6 +14,59 @@ from omegaconf import DictConfig, OmegaConf
 from eb_jepa.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+def parse_training_cli_args(
+    argv: Optional[Sequence[str]] = None,
+    default_fname: str = "",
+) -> Tuple[str, Optional[str], Dict[str, Any]]:
+    """Parse trainer CLI args with OmegaConf dot-list overrides."""
+    args = list(sys.argv[1:] if argv is None else argv)
+    fname = default_fname
+    folder = None
+    dotlist = []
+    positional_fname_seen = False
+
+    i = 0
+    while i < len(args):
+        arg = args[i]
+
+        if arg == "--fname":
+            i += 1
+            if i >= len(args):
+                raise ValueError("--fname requires a value")
+            fname = args[i]
+        elif arg.startswith("--fname="):
+            fname = arg.split("=", 1)[1]
+        elif arg == "--folder":
+            i += 1
+            if i >= len(args):
+                raise ValueError("--folder requires a value")
+            folder = args[i]
+        elif arg.startswith("--folder="):
+            folder = arg.split("=", 1)[1]
+        elif "=" in arg:
+            dotlist.append(arg[2:] if arg.startswith("--") else arg)
+        elif not positional_fname_seen:
+            fname = arg
+            positional_fname_seen = True
+        else:
+            raise ValueError(f"Unexpected argument: {arg}")
+
+        i += 1
+
+    overrides = OmegaConf.to_container(OmegaConf.from_dotlist(dotlist), resolve=True)
+    return fname, folder, overrides
+
+
+def run_training_cli(
+    run_fn: Callable[..., Any],
+    default_fname: str,
+    argv: Optional[Sequence[str]] = None,
+) -> Any:
+    """Run a trainer from CLI args using the documented dot-override syntax."""
+    fname, folder, overrides = parse_training_cli_args(argv, default_fname)
+    return run_fn(fname=fname, folder=folder, **overrides)
 
 
 def setup_device(device: str = "auto") -> torch.device:
