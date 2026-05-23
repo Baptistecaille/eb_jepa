@@ -78,6 +78,40 @@ def setup_device(device: str = "auto") -> torch.device:
     return device
 
 
+def configure_torch_for_cuda() -> None:
+    """Enable CUDA runtime settings that typically help NVIDIA training throughput."""
+    if not torch.cuda.is_available():
+        return
+
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+    try:
+        torch.set_float32_matmul_precision("high")
+    except AttributeError:
+        pass
+
+
+def resolve_amp_dtype(requested_dtype: Optional[str], device: torch.device) -> torch.dtype:
+    """Choose the most appropriate AMP dtype for the current device."""
+    normalized = (requested_dtype or "auto").lower()
+    if normalized in {"fp16", "float16"}:
+        return torch.float16
+    if normalized in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    if normalized not in {"auto", ""}:
+        raise ValueError(
+            f"Unknown AMP dtype '{requested_dtype}'. Use auto, float16, or bfloat16."
+        )
+
+    if device.type != "cuda":
+        return torch.bfloat16
+
+    major, _minor = torch.cuda.get_device_capability(device)
+    return torch.bfloat16 if major >= 8 else torch.float16
+
+
 def setup_seed(seed: int) -> None:
     """Set random seeds for Python, NumPy, and PyTorch for reproducibility."""
     random.seed(seed)

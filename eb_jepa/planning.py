@@ -331,6 +331,7 @@ def main_eval(
     task_data = {
         "success_rate": np.mean(successes),
         "mean_state_dist": np.mean(distances),
+        "mean_episode_length": np.mean([len(obs) for obs in episode_observations]),
         "avg_episode_time": avg_episode_time,
     }
     pd.DataFrame([task_data]).to_csv(f"{eval_folder}/eval.csv", mode="a", index=None)

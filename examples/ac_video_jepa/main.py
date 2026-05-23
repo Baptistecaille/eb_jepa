@@ -29,7 +29,14 @@ from eb_jepa.logging import get_logger
 from eb_jepa.losses import SquareLossSeq, VC_IDM_Sim_Regularizer
 from eb_jepa.schedulers import CosineWithWarmup
 from eb_jepa.state_decoder import MLPXYHead
+from eb_jepa.surprise import (
+    save_surprise_heatmaps,
+    save_surprise_npz,
+    summarize_gate,
+    summarize_surprise,
+)
 from eb_jepa.training_utils import (
+    configure_torch_for_cuda,
     get_default_dev_name,
     get_exp_name,
     get_unified_experiment_dir,
@@ -43,11 +50,63 @@ from eb_jepa.training_utils import (
     save_checkpoint,
     setup_device,
     setup_seed,
+    resolve_amp_dtype,
     setup_wandb,
 )
 from examples.ac_video_jepa.eval import launch_plan_eval, launch_unroll_eval
 
 logger = get_logger(__name__)
+
+
+def _unwrap_compiled_model(model):
+    return getattr(model, "_orig_mod", model)
+
+
+def _maybe_log_surprise_artifacts(
+    model,
+    cfg,
+    folder: Path,
+    global_step: int,
+    log_data: dict,
+):
+    surprise_cfg = cfg.get("surprise", {})
+    if not surprise_cfg.get("enabled", False):
+        return
+    model_info = getattr(_unwrap_compiled_model(model), "last_unroll_info", {})
+    surprise_map = model_info.get("surprise_map")
+    if surprise_map is None:
+        return
+
+    log_data.update(summarize_surprise(surprise_map))
+    gate_map = model_info.get("gate_map")
+    adaptive_threshold = model_info.get("adaptive_threshold")
+    if gate_map is not None:
+        log_data.update(summarize_gate(gate_map, adaptive_threshold))
+
+    if not surprise_cfg.get("log_to_local", True):
+        return
+    if surprise_cfg.get("save_heatmaps_every", 0) > 0:
+        if global_step % surprise_cfg.save_heatmaps_every == 0:
+            save_surprise_heatmaps(
+                folder / "surprise" / "heatmaps",
+                surprise_map,
+                step=global_step,
+                gate_map=gate_map,
+                timesteps=(0, -1),
+            )
+    if surprise_cfg.get("save_npz_every", 0) > 0:
+        if global_step % surprise_cfg.save_npz_every == 0:
+            max_batches = surprise_cfg.get("max_npz_batches", 16)
+            existing = list((folder / "surprise" / "npz").glob("*.npz"))
+            if len(existing) < max_batches:
+                save_surprise_npz(
+                    folder / "surprise" / "npz",
+                    surprise_map,
+                    step=global_step,
+                    batch_index=0,
+                    gate_map=gate_map,
+                    adaptive_threshold=adaptive_threshold,
+                )
 
 
 def run(
@@ -96,6 +155,7 @@ def run(
 
     # -- SETUP
     setup_device("auto")
+    configure_torch_for_cuda()
     setup_seed(cfg.meta.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -123,11 +183,13 @@ def run(
     )
 
     # Mixed precision setup
-    dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16}
-    dtype = dtype_map.get(cfg.training.get("dtype", "float16").lower(), torch.float16)
+    dtype = resolve_amp_dtype(cfg.training.get("dtype", "auto"), device)
     use_amp = cfg.training.get("use_amp", True)
-    scaler = GradScaler(device.type, enabled=use_amp)
-    logger.info(f"Using AMP with {dtype=}" if use_amp else f"AMP disabled")
+    scaler = GradScaler(
+        device.type,
+        enabled=use_amp and device.type == "cuda" and dtype == torch.float16,
+    )
+    logger.info(f"Using AMP with dtype={dtype}" if use_amp else "AMP disabled")
 
     # -- ENV (for plan/unroll eval)
     enable_eval = cfg.meta.get("enable_plan_eval", False)
@@ -146,7 +208,10 @@ def run(
         _, _, env_config = init_data(
             env_name=cfg.data.env_name, cfg_data=dict(eval_cfg_dict.get("data", {}))
         )
-        num_eval_episodes = eval_cfg_dict.get("meta", {}).get("num_eval_episodes", 10)
+        num_eval_episodes = cfg.eval.get(
+            "num_eval_episodes",
+            eval_cfg_dict.get("meta", {}).get("num_eval_episodes", 10),
+        )
 
         def env_creator():
             from eb_jepa.datasets.two_rooms.env import DotWall
@@ -202,6 +267,8 @@ def run(
         )
     else:
         raise ValueError(f"Unknown encoder_architecture: {encoder_architecture}")
+    encoder = encoder.to(device)
+    test_input = test_input.to(device)
     test_output = encoder(test_input)
     _, f, _, h, w = test_output.shape
     if encoder_architecture == "cortical":
@@ -214,6 +281,11 @@ def run(
             grid_h=h,
             grid_w=w,
             hidden_dim=cfg.model.get("predictor_hidden_dim"),
+            use_spatial_neighborhood=cfg.model.get("use_spatial_neighborhood", True),
+            use_global_memory=cfg.model.get("use_global_memory", True),
+            use_top_down_feedback=cfg.model.get("use_top_down_feedback", True),
+            use_surprise_gate=cfg.model.get("use_surprise_gate", False),
+            surprise_gate_kwargs=dict(cfg.get("surprise_gate", {})),
         )
     else:
         predictor = RNNPredictor(
@@ -249,6 +321,8 @@ def run(
     )
     ploss = SquareLossSeq()
     jepa = JEPA(encoder, aencoder, predictor, regularizer, ploss).to(device)
+    if cfg.get("surprise", {}).get("enabled", False):
+        jepa.surprise_eps = cfg.surprise.get("eps", 1e-8)
 
     # Log model structure and parameters
     encoder_params = sum(p.numel() for p in encoder.parameters())
@@ -292,8 +366,9 @@ def run(
 
     # Compile
     if torch.cuda.is_available() and cfg.model.compile:
-        logger.info("✅ Compiling model with torch.compile")
-        jepa = torch.compile(jepa)
+        compile_mode = cfg.model.get("compile_mode", "reduce-overhead")
+        logger.info(f"✅ Compiling model with torch.compile (mode={compile_mode})")
+        jepa = torch.compile(jepa, mode=compile_mode)
 
     # -- EVAL ONLY MODE
     if cfg.meta.get("eval_only_mode", False):
@@ -343,13 +418,14 @@ def run(
             itr_start_time = time()
             global_step = epoch * len(loader) + idx
 
-            x = x.to(device)
-            a = a.to(device)
-            loc = loc.to(device)
+            non_blocking = device.type == "cuda"
+            x = x.to(device, non_blocking=non_blocking)
+            a = a.to(device, non_blocking=non_blocking)
+            loc = loc.to(device, non_blocking=non_blocking)
             total_loss = torch.tensor(0.0, device=device)
 
             # Calculate JEPA loss
-            jepa_optimizer.zero_grad()
+            jepa_optimizer.zero_grad(set_to_none=True)
             with autocast(device.type, enabled=use_amp, dtype=dtype):
                 _, (jepa_loss, regl, regl_unweight, regldict, pl) = jepa.unroll(
                     x,
@@ -377,7 +453,7 @@ def run(
             jepa_scheduler.step()
 
             # Calculate probe loss
-            probe_optimizer.zero_grad()
+            probe_optimizer.zero_grad(set_to_none=True)
             with autocast(device.type, enabled=use_amp, dtype=dtype):
                 xy_loss = xy_prober(
                     observations=x[:, :, :1],
@@ -401,7 +477,14 @@ def run(
             )
 
             itr_time = time() - itr_start_time
-            if global_step % cfg.logging.log_every == 0:
+            surprise_cfg = cfg.get("surprise", {})
+            should_log_train = global_step % cfg.logging.log_every == 0
+            should_log_surprise = (
+                surprise_cfg.get("enabled", False)
+                and global_step % surprise_cfg.get("log_every", cfg.logging.log_every)
+                == 0
+            )
+            if should_log_train or should_log_surprise:
                 log_data = {
                     "train/total_loss": total_loss.item(),
                     "train/reg_loss": regl.item(),
@@ -417,7 +500,23 @@ def run(
                 for loss_name, loss_value in regldict.items():
                     log_data[f"train/regl/{loss_name}"] = loss_value
 
+                _maybe_log_surprise_artifacts(
+                    jepa,
+                    cfg,
+                    folder,
+                    global_step,
+                    log_data,
+                )
+
                 if cfg.logging.get("log_wandb"):
+                    if surprise_cfg.get("enabled", False) and not surprise_cfg.get(
+                        "log_to_wandb", True
+                    ):
+                        log_data = {
+                            key: value
+                            for key, value in log_data.items()
+                            if not key.startswith(("surprise/", "gate/"))
+                        }
                     wandb.log(log_data, step=global_step)
 
             # Planning eval (only if eval is enabled)

@@ -214,6 +214,56 @@ class TopDownFeedback(nn.Module):
         return self.net(torch.cat([memory, pos], dim=-1))
 
 
+class SurpriseGate(nn.Module):
+    """Causal gate that uses observed surprise to blend candidate column states."""
+
+    def __init__(
+        self,
+        alpha: float = 10.0,
+        threshold_momentum: float = 0.99,
+        adaptive_threshold: bool = True,
+        initial_threshold: float = 0.05,
+        min_gate: float = 0.05,
+        max_gate: float = 1.0,
+        detach_surprise: bool = True,
+    ):
+        super().__init__()
+        self.alpha = alpha
+        self.threshold_momentum = threshold_momentum
+        self.use_adaptive_threshold = adaptive_threshold
+        self.min_gate = min_gate
+        self.max_gate = max_gate
+        self.detach_surprise = detach_surprise
+        self.register_buffer(
+            "adaptive_threshold", torch.tensor(float(initial_threshold))
+        )
+
+    def forward(
+        self, previous_state: Tensor, candidate_state: Tensor, surprise_map: Tensor
+    ) -> tuple[Tensor, Tensor]:
+        if previous_state.shape != candidate_state.shape:
+            raise ValueError("previous_state and candidate_state must have same shape")
+        if previous_state.ndim != 5 or surprise_map.ndim != 4:
+            raise ValueError(
+                "Expected states [B, D, T, H, W] and surprise_map [B, T, H, W]"
+            )
+        surprise_for_gate = (
+            surprise_map.detach() if self.detach_surprise else surprise_map
+        )
+        if self.use_adaptive_threshold and self.training:
+            batch_threshold = surprise_for_gate.mean()
+            self.adaptive_threshold.mul_(self.threshold_momentum).add_(
+                batch_threshold * (1.0 - self.threshold_momentum)
+            )
+        raw_gate = torch.sigmoid(
+            self.alpha * (surprise_for_gate - self.adaptive_threshold)
+        )
+        gate_map = self.min_gate + (self.max_gate - self.min_gate) * raw_gate
+        state_gate = gate_map.unsqueeze(1)
+        corrected = state_gate * candidate_state + (1.0 - state_gate) * previous_state
+        return corrected, gate_map
+
+
 class CorticalTemporalPredictor(nn.Module):
     """Autoregressive cortical predictor compatible with JEPA.unroll."""
 
@@ -228,6 +278,11 @@ class CorticalTemporalPredictor(nn.Module):
         grid_h: int = 4,
         grid_w: int = 4,
         hidden_dim: int | None = None,
+        use_spatial_neighborhood: bool = True,
+        use_global_memory: bool = True,
+        use_top_down_feedback: bool = True,
+        use_surprise_gate: bool = False,
+        surprise_gate_kwargs: dict | None = None,
     ):
         super().__init__()
         self.latent_dim = latent_dim
@@ -236,6 +291,9 @@ class CorticalTemporalPredictor(nn.Module):
         self.grid_h = grid_h
         self.grid_w = grid_w
         self.n_columns = grid_h * grid_w
+        self.use_spatial_neighborhood = use_spatial_neighborhood
+        self.use_global_memory = use_global_memory
+        self.use_top_down_feedback = use_top_down_feedback
         updater_hidden_dim = hidden_dim or memory_dim
 
         self.neighborhood = SpatialNeighborhoodAggregator(latent_dim, grid_h, grid_w)
@@ -252,6 +310,9 @@ class CorticalTemporalPredictor(nn.Module):
             nn.LayerNorm(latent_dim),
             nn.GELU(),
             nn.Linear(latent_dim, latent_dim),
+        )
+        self.surprise_gate = (
+            SurpriseGate(**(surprise_gate_kwargs or {})) if use_surprise_gate else None
         )
 
     def forward(self, state: Tensor, action: Tensor) -> Tensor:
@@ -274,8 +335,16 @@ class CorticalTemporalPredictor(nn.Module):
 
         Z = state[:, :, 0].permute(0, 2, 3, 1).reshape(B, self.n_columns, D)
         action_t = action[:, :, 0]
-        messages = self.neighborhood(Z)
-        memory = self.memory(Z.mean(dim=1), action_t)
+        if self.use_spatial_neighborhood:
+            messages = self.neighborhood(Z)
+        else:
+            messages = torch.zeros_like(Z)
+        if self.use_global_memory:
+            memory = self.memory(Z.mean(dim=1), action_t)
+        else:
+            memory = torch.zeros(
+                B, self.memory_dim, device=state.device, dtype=state.dtype
+            )
 
         local_preds = []
         for i in range(self.n_columns):
@@ -287,7 +356,17 @@ class CorticalTemporalPredictor(nn.Module):
             )
             local_preds.append(z_next_i)
         Z_tilde = torch.stack(local_preds, dim=1)
-        feedback = self.topdown(memory)
-        Z_next = Z_tilde + self.refine(torch.cat([Z_tilde, feedback], dim=-1))
+        if self.use_top_down_feedback:
+            feedback = self.topdown(memory)
+            Z_next = Z_tilde + self.refine(torch.cat([Z_tilde, feedback], dim=-1))
+        else:
+            Z_next = Z_tilde
         Z_next = Z_next.view(B, self.grid_h, self.grid_w, D).permute(0, 3, 1, 2)
         return Z_next.unsqueeze(2).contiguous()
+
+    def apply_surprise_gate(
+        self, previous_state: Tensor, candidate_state: Tensor, surprise_map: Tensor
+    ) -> tuple[Tensor, Tensor | None]:
+        if self.surprise_gate is None:
+            return candidate_state, None
+        return self.surprise_gate(previous_state, candidate_state, surprise_map)

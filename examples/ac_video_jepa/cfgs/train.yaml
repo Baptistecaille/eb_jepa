@@ -22,15 +22,20 @@ data:
   persistent_workers: true
 training:
   use_amp: true
-  dtype: bfloat16
+  dtype: auto
 model:
   compile: true
+  compile_mode: reduce-overhead
   dobs: 2
   henc: 32
   hpre: 32
   dstc: 32
   nsteps: 8
   encoder_architecture: impala # impala | cortical
+  use_spatial_neighborhood: true
+  use_global_memory: true
+  use_top_down_feedback: true
+  use_surprise_gate: false
   latent_dim: 32
   grid_h: 5
   grid_w: 5
@@ -59,6 +64,24 @@ optim:
 eval:
   plan_cfg_path: examples/ac_video_jepa/cfgs/planning_mppi.yaml # eb_jepa/planning_mppi.yaml
   eval_cfg_path: examples/ac_video_jepa/cfgs/eval.yaml
+surprise:
+  enabled: true
+  metric: normalized_l2
+  eps: 1.0e-8
+  log_every: 100
+  save_heatmaps_every: 500
+  save_npz_every: 1000
+  max_npz_batches: 16
+  log_to_wandb: true
+  log_to_local: true
+surprise_gate:
+  alpha: 10.0
+  threshold_momentum: 0.99
+  adaptive_threshold: true
+  initial_threshold: 0.05
+  min_gate: 0.05
+  max_gate: 1.0
+  detach_surprise: true
 
 # --- Parameters used when running with --full-sweep
 # By default, only the parameters specified above are used

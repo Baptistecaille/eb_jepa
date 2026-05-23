@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 
 from eb_jepa.logging import get_logger
+from eb_jepa.surprise import compute_surprise_map
 
 logging = get_logger(__name__)
 
@@ -42,6 +43,8 @@ class JEPA(JEPAbase):
         self.predcost = predcost
         self.ploss = 0
         self.rloss = 0
+        self.surprise_eps = 1e-8
+        self.last_unroll_info = {}
 
     @torch.no_grad()
     def infer(self, observations, actions):
@@ -119,6 +122,7 @@ class JEPA(JEPAbase):
             - losses: None if compute_loss=False, otherwise tuple of 5 elements:
               (total_loss, reg_loss, reg_loss_unweighted, reg_loss_dict, pred_loss)
         """
+        self.last_unroll_info = {}
         state = self.encoder(observations)
         context_length = getattr(self.predictor, "context_length", 0)
 
@@ -167,6 +171,8 @@ class JEPA(JEPAbase):
             effective_ctxt_window = 1 if self.single_unroll else ctxt_window_time
 
             predicted_states = state[:, :, :effective_ctxt_window]
+            surprise_maps = []
+            gate_maps = []
             for i in range(nsteps):
                 # Take last ctxt_window_time states
                 context_states = predicted_states[:, :, -effective_ctxt_window:]
@@ -179,6 +185,20 @@ class JEPA(JEPAbase):
                     context_actions = None
                 # Predict and take only last timestep
                 pred_step = self.predictor(context_states, context_actions)[:, :, -1:]
+                step_for_loss = pred_step
+                gate_map = None
+                if compute_loss and hasattr(self.predictor, "apply_surprise_gate"):
+                    target_step = state[:, :, i + 1 : i + 2]
+                    surprise_map = compute_surprise_map(
+                        pred_step, target_step, eps=self.surprise_eps
+                    )
+                    gated_step, gate_map = self.predictor.apply_surprise_gate(
+                        context_states[:, :, -1:], pred_step, surprise_map
+                    )
+                    pred_step = gated_step
+                    surprise_maps.append(surprise_map)
+                    if gate_map is not None:
+                        gate_maps.append(gate_map)
                 # Append prediction to sequence
                 predicted_states = torch.cat([predicted_states, pred_step], dim=2)
                 # Collect step if requested
@@ -186,8 +206,18 @@ class JEPA(JEPAbase):
                     all_steps.append(predicted_states.clone())
                 if compute_loss:
                     ploss += (
-                        self.predcost(pred_step, state[:, :, i + 1 : i + 2]) / nsteps
+                        self.predcost(step_for_loss, state[:, :, i + 1 : i + 2])
+                        / nsteps
                     )
+            if compute_loss and surprise_maps:
+                self.last_unroll_info["surprise_map"] = torch.cat(surprise_maps, dim=1)
+                if gate_maps:
+                    self.last_unroll_info["gate_map"] = torch.cat(gate_maps, dim=1)
+                    gate = getattr(self.predictor, "surprise_gate", None)
+                    if gate is not None:
+                        self.last_unroll_info["adaptive_threshold"] = (
+                            gate.adaptive_threshold.detach().clone()
+                        )
         else:
             raise ValueError(f"Unknown unroll_mode: {unroll_mode}")
 
